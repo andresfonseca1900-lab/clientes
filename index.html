@@ -241,20 +241,49 @@
     cursor:pointer;
   }
 
-  #fabExport{
+  #fabWrap{
     position:fixed;
     bottom:18px;right:18px;
+    z-index:10;
+    display:flex;
+    flex-direction:column;
+    align-items:flex-end;
+    gap:8px;
+  }
+  #fabBackup{
     background:var(--panel2);
     color:var(--chrome);
     border:1px solid var(--line);
-    border-radius:24px;
-    padding:12px 18px;
-    font-size:13px;
-    font-weight:600;
+    border-radius:50%;
+    width:46px;height:46px;
+    font-size:20px;
+    font-weight:700;
     box-shadow:0 4px 14px rgba(0,0,0,.5);
     cursor:pointer;
-    z-index:10;
   }
+  #backupMenu{
+    display:none;
+    flex-direction:column;
+    gap:6px;
+    background:var(--panel2);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:8px;
+    box-shadow:0 4px 20px rgba(0,0,0,.6);
+  }
+  #backupMenu.show{display:flex;}
+  #backupMenu button{
+    background:var(--panel);
+    color:var(--white);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:10px 14px;
+    font-size:13px;
+    text-align:left;
+    white-space:nowrap;
+    cursor:pointer;
+  }
+  #backupMenu button:active{border-color:var(--red);}
   #toast{
     position:fixed;
     bottom:70px;left:50%;
@@ -294,7 +323,16 @@
 
 <div id="list"></div>
 
-<button id="fabExport" onclick="exportCSV()">⬇ Exportar CSV</button>
+<div id="fabWrap">
+  <button id="fabBackup" onclick="toggleBackupMenu()">⋮</button>
+  <div id="backupMenu">
+    <button onclick="exportCSV()">⬇ Exportar CSV</button>
+    <button onclick="exportJSON()">💾 Respaldo (JSON)</button>
+    <button onclick="document.getElementById('importInput').click()">⬆ Restaurar respaldo</button>
+  </div>
+</div>
+<input type="file" id="importInput" accept=".json" style="display:none">
+<div id="storageWarning" style="display:none"></div>
 
 <div id="overlay" onclick="if(event.target===this) closeForm()">
   <div id="sheet">
@@ -334,35 +372,78 @@
 let clients = [];
 let editingId = null;
 
-async function loadAll(){
+function loadAll(){
   try{
-    const res = await window.storage.get('clients-data', false);
-    clients = res && res.value ? JSON.parse(res.value) : [];
+    const raw = localStorage.getItem('sa_clients_data');
+    clients = raw ? JSON.parse(raw) : [];
   }catch(e){
     clients = [];
   }
   try{
-    const logoRes = await window.storage.get('company-logo', false);
-    if(logoRes && logoRes.value){
-      document.getElementById('logoImg').src = logoRes.value;
+    const logo = localStorage.getItem('sa_company_logo');
+    if(logo){
+      document.getElementById('logoImg').src = logo;
     }
   }catch(e){
     // sin logo personalizado guardado: se usa el logo por defecto incrustado
   }
   try{
-    const nameRes = await window.storage.get('company-name', false);
-    if(nameRes && nameRes.value){
-      document.getElementById('companyTitle').textContent = nameRes.value;
+    const name = localStorage.getItem('sa_company_name');
+    if(name){
+      document.getElementById('companyTitle').textContent = name;
     }
   }catch(e){}
   render();
+  maybeRemindBackup();
+  checkStorageHealth();
 }
 
-async function persist(){
+function persist(){
   try{
-    await window.storage.set('clients-data', JSON.stringify(clients), false);
+    localStorage.setItem('sa_clients_data', JSON.stringify(clients));
+    return true;
   }catch(e){
-    showToast('Error al guardar');
+    showToast('⚠️ Error al guardar en el dispositivo.');
+    return false;
+  }
+}
+
+let autoBackupTimer = null;
+function autoDownloadBackup(){
+  // Descarga silenciosa de respaldo tras cada guardado, con un pequeño retraso
+  // para no saturar si se guardan varios clientes seguidos.
+  if(autoBackupTimer) clearTimeout(autoBackupTimer);
+  autoBackupTimer = setTimeout(()=>{
+    if(clients.length === 0) return;
+    const blob = new Blob([JSON.stringify(clients, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'respaldo_clientes_auto.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 600);
+}
+
+function checkStorageHealth(){
+  const box = document.getElementById('storageWarning');
+  try{
+    const testKey = '__sa_test__';
+    localStorage.setItem(testKey, '1');
+    localStorage.removeItem(testKey);
+    box.style.display = 'none';
+  }catch(e){
+    box.style.display = 'block';
+    box.style.cssText = 'display:block;margin:0 16px 10px;padding:12px 14px;background:#3a1414;border:1px solid var(--red);border-radius:9px;font-size:13px;color:#ffb4a8;';
+    box.textContent = '⚠️ Este navegador no permite guardar datos aquí (modo privado o almacenamiento bloqueado). Usa siempre "Respaldo (JSON)" para no perder nada.';
+  }
+}
+
+function maybeRemindBackup(){
+  if(clients.length > 0 && clients.length % 10 === 0){
+    showToast('Tip: exporta un respaldo CSV cada tanto 👍');
   }
 }
 
@@ -431,7 +512,7 @@ function closeForm(){
   editingId = null;
 }
 
-async function saveClient(){
+function saveClient(){
   const empresa = document.getElementById('f_empresa').value.trim();
   if(!empresa){
     showToast('El nombre de la empresa es obligatorio');
@@ -450,20 +531,88 @@ async function saveClient(){
   }else{
     clients.push({id: 'c_'+Date.now(), ...data});
   }
-  await persist();
+
+  // 1) Guardado inmediato en el dispositivo
+  const okSaved = persist();
+
+  // 2) Verificación real: vuelve a leer del disco para confirmar que sí quedó ahí
+  let verified = false;
+  try{
+    const check = JSON.parse(localStorage.getItem('sa_clients_data') || '[]');
+    verified = check.length === clients.length;
+  }catch(e){ verified = false; }
+
+  // 3) Respaldo automático silencioso: descarga un .json cada vez, sin que tengas que acordarte
+  try{ autoDownloadBackup(); }catch(e){}
+
   closeForm();
   render();
-  showToast('Cliente guardado');
+
+  if(!okSaved || !verified){
+    showToast('⚠️ No se pudo confirmar el guardado. Usa "Respaldo (JSON)" ya mismo.');
+    return;
+  }
+  showToast('Cliente guardado ✓');
 }
 
-async function deleteClient(){
+function deleteClient(){
   if(!editingId) return;
   clients = clients.filter(c=>c.id!==editingId);
-  await persist();
+  persist();
   closeForm();
   render();
   showToast('Cliente eliminado');
 }
+
+function toggleBackupMenu(){
+  document.getElementById('backupMenu').classList.toggle('show');
+}
+
+function exportJSON(){
+  if(clients.length === 0){
+    showToast('No hay clientes para respaldar');
+    return;
+  }
+  const blob = new Blob([JSON.stringify(clients, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const fecha = new Date().toISOString().slice(0,10);
+  a.download = 'respaldo_clientes_'+fecha+'.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  toggleBackupMenu();
+  showToast('Respaldo descargado ✓ Guárdalo en un lugar seguro');
+}
+
+document.getElementById('importInput').addEventListener('change', function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = function(ev){
+    try{
+      const imported = JSON.parse(ev.target.result);
+      if(!Array.isArray(imported)) throw new Error('formato inválido');
+      const existingIds = new Set(clients.map(c=>c.id));
+      let added = 0;
+      imported.forEach(c=>{
+        if(c.empresa && !existingIds.has(c.id)){
+          clients.push({...c, id: c.id || 'c_'+Date.now()+Math.random().toString(36).slice(2)});
+          added++;
+        }
+      });
+      persist();
+      render();
+      showToast(added + ' clientes restaurados ✓');
+    }catch(err){
+      showToast('El archivo de respaldo no es válido');
+    }
+  };
+  reader.readAsText(file);
+  toggleBackupMenu();
+});
 
 function exportCSV(){
   if(clients.length === 0){
@@ -502,9 +651,9 @@ document.getElementById('logoInput').addEventListener('change', function(e){
     const dataUrl = ev.target.result;
     document.getElementById('logoImg').src = dataUrl;
     try{
-      await window.storage.set('company-logo', dataUrl, false);
+      localStorage.setItem('sa_company_logo', dataUrl);
     }catch(err){
-      showToast('No se pudo guardar el logo');
+      showToast('No se pudo guardar el logo (puede ser muy pesado)');
     }
   };
   reader.readAsDataURL(file);
